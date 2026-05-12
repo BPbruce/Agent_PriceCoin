@@ -1,48 +1,63 @@
-import json  # 确保已导入
-from crypto_utils import query_gpt, fetch_crypto_price
+from fastapi import FastAPI, HTTPException
+import requests
 
-if __name__ == "__main__":
-    while True:
-        user_input = input("请输入你的问题 (输入 'exit' 退出): ")
-        if user_input.lower() == "exit":
-            break
+app = FastAPI()
 
-        # 调用 GPT 模型
-        gpt_result = query_gpt(user_input)
-        # print("GPT 响应:", gpt_result)  # 注释掉这行，不显示原始响应
+COINGECKO_API_URL = "https://api.coingecko.com/api/v3/simple/price"
+COINGECKO_COINS_LIST_URL = "https://api.coingecko.com/api/v3/coins/list"
+REQUEST_TIMEOUT = 10
 
-        # 解析 GPT 输出
-        if "Unknown token" in gpt_result:
-            print("无法识别的币种，请检查输入。")
-        else:
-            try:
-                # 处理 GPT 响应中的引号问题
-                gpt_result = gpt_result.strip("'")  # 移除可能的外部单引号
-                gpt_result = gpt_result.replace("True", "true").replace("False", "false")
-                
-                # 使用 json.loads() 解析 GPT 返回的 JSON 字符串
-                gpt_data = json.loads(
-                    gpt_result.replace("'", '"')  # 替换单引号为双引号
-                )
+# 缓存支持的币种
+coins_cache = {}
 
-                token_name = gpt_data.get("token_name")
-                if token_name:
-                    # 将币种名称转换为小写字母，以确保与 FastAPI 兼容
-                    token_name = token_name.lower()
-                    print(f"\n正在查询币种: {token_name}")
-                    
-                    # 调用 FastAPI 获取价格
-                    price_result = fetch_crypto_price(token_name)
-                    
-                    if "error" in price_result:
-                        print(f"获取价格失败: {price_result['error']}")
-                    else:
-                        print("\n价格信息:")
-                        print(f"币种: {price_result['coin']}")
-                        print(f"价格: {price_result['price']} {price_result['currency'].upper()}")
-                else:
-                    print("GPT 响应中未包含有效的币种名称。")
-            except json.JSONDecodeError as e:
-                print("解析 GPT 响应时出错: 无法解析为 JSON:", e)
-            except Exception as e:
-                print("解析 GPT 响应时发生未知错误:", e)
+
+def get_supported_coins():
+    """获取支持的币种列表"""
+    if not coins_cache:
+        try:
+            response = requests.get(COINGECKO_COINS_LIST_URL, timeout=REQUEST_TIMEOUT)
+            response.raise_for_status()
+            coins_data = response.json()
+            coins_cache.update({coin["id"]: coin["name"] for coin in coins_data})
+        except requests.RequestException:
+            raise HTTPException(status_code=500, detail="Failed to fetch supported coins from CoinGecko.")
+    return coins_cache
+
+
+@app.get("/")
+def read_root():
+    return {"message": "Welcome to the Crypto Price API! Use /price endpoint to get prices."}
+
+
+@app.get("/price/")
+def get_crypto_price(coin: str, currency: str = "usd"):
+    """获取加密货币的实时价格"""
+    supported_coins = get_supported_coins()
+
+    if coin not in supported_coins:
+        raise HTTPException(
+            status_code=404,
+            detail=f"币种 '{coin}' 不支持。支持的币种ID请访问 /coins/ 端点查看。",
+        )
+
+    try:
+        response = requests.get(
+            COINGECKO_API_URL,
+            params={"ids": coin, "vs_currencies": currency},
+            timeout=REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        data = response.json()
+    except requests.RequestException as e:
+        raise HTTPException(status_code=500, detail=f"从 CoinGecko 获取价格失败: {str(e)}")
+
+    if coin not in data or currency not in data[coin]:
+        raise HTTPException(status_code=404, detail=f"在 API 响应中未找到 '{coin}' 的价格数据")
+
+    return {"coin": supported_coins[coin], "price": data[coin][currency], "currency": currency}
+
+
+@app.get("/coins/")
+def get_coins():
+    """列出支持的币种"""
+    return {"supported_coins": get_supported_coins()}
